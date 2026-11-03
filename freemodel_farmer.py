@@ -1,241 +1,246 @@
-import html
 #!/usr/bin/env python3
-# ==============================================================================
-# FREEMODEL.IN ACCOUNT FARMER & API TESTER
-# ==============================================================================
+"""CLI freemodel-farm: registrasi multi-instance, 1 akun = 1 akun Telegram.
 
-import requests
-import re
-import random
-import string
-import time
+Contoh:
+  py -3.12 freemodel_farmer.py pool
+  py -3.12 freemodel_farmer.py telegram-init 3
+  py -3.12 freemodel_farmer.py run --count 5 --concurrency 5
+  py -3.12 freemodel_farmer.py run --count 5 --dry-run
+  py -3.12 freemodel_farmer.py report
+  py -3.12 freemodel_farmer.py models
+"""
+
+from __future__ import annotations
+
+import argparse
 import json
-from typing import Optional, Dict, Any, List
+import sys
 
-BASE_URL = "https://freemodel.in"
-API_V1 = f"{BASE_URL}/v1"
+if sys.version_info < (3, 10):
+    print("[-] Butuh Python 3.10+. Jalankan dengan: py -3.12 freemodel_farmer.py")
+    sys.exit(1)
 
-DEFAULT_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive"
-}
+from farm import config as cfg
+from farm.client import FreeModelClient
+from farm.runner import FarmRunner, Lifecycle
+from farm.store import AccountRecord, AccountStore, read_json
+from farm.telegram import dump_slots_template
 
-def random_string(length: int = 8) -> str:
-    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=length))
 
-def random_name() -> str:
-    first_names = ["Alex", "Dante", "Victor", "Rhea", "Cipher", "Kael", "Nova", "Zero", "Ares"]
-    last_names = ["Vance", "Ryker", "Sterling", "Kovacs", "Cross", "Stark", "Draven"]
-    return f"{random.choice(first_names)} {random.choice(last_names)} {random_string(4)}"
+def cmd_pool(_args: argparse.Namespace) -> int:
+    cfg.ensure_dirs()
+    if not cfg.SLOTS_FILE.is_file():
+        print(f"[-] Belum ada {cfg.SLOTS_FILE}")
+        print("[*] Jalankan: py -3.12 freemodel_farmer.py telegram-init <jumlah>")
+        return 1
+    pool = cfg.load_pool()
+    summary = pool.summary()
+    bound = pool.bound_emails()
+    report = pool.preflight()
+    print("=" * 64)
+    print(" STATUS POOL TELEGRAM (aturan: 1 akun freemodel = 1 akun Telegram)")
+    print("=" * 64)
+    print(f" total slot  : {summary['total']}")
+    print(f" terikat     : {summary['bound']}")
+    print(f" ter-reserve : {summary['reserved']}")
+    print(f" bebas       : {summary['free']}")
+    print(f" siap sesi   : {len(report['ready'])}   belum siap: {len(report['not_ready'])}")
+    for slot in pool.slots:
+        ok, reason = pool.slot_ready(slot)
+        bound_to = bound.get(slot.slot_id, "-")
+        mark = "siap" if ok else "BELUM"
+        print(f"   {slot.slot_id:<9} {mark:<6} {reason:<34} -> {bound_to}")
+    if report["not_ready"]:
+        print("\n[*] Lengkapi sesi: py -3.12 tg_session.py <slot_id>")
+    return 0
 
-class FreeModelFarmer:
-    def __init__(self, timeout: int = 90, retries: int = 3):
-        self.timeout = timeout
-        self.retries = retries
-        self.session = requests.Session()
-        self.session.headers.update(DEFAULT_HEADERS)
 
-    def _fetch_csrf_token(self) -> Optional[str]:
-        for attempt in range(1, self.retries + 1):
-            try:
-                r = self.session.get(f"{BASE_URL}/register", timeout=self.timeout)
-                if r.status_code == 200:
-                    match = re.search(r'name="_token"\s+value="([^"]+)"', r.text)
-                    if match:
-                        return match.group(1)
-            except requests.RequestException:
-                time.sleep(2)
-        return None
+def cmd_preflight(_args: argparse.Namespace) -> int:
+    """Cek kesiapan semua slot sebelum farm; keluar non-nol bila ada yang belum."""
+    cfg.ensure_dirs()
+    if not cfg.SLOTS_FILE.is_file():
+        print(f"[-] {cfg.SLOTS_FILE.name} belum ada. Jalankan telegram-init dulu.")
+        return 1
+    pool = cfg.load_pool()
+    report = pool.preflight()
+    for slot_id in report["ready"]:
+        print(f"[+] {slot_id:<9} siap — {report['detail'][slot_id]}")
+    for slot_id in report["not_ready"]:
+        print(f"[-] {slot_id:<9} belum siap — {report['detail'][slot_id]}")
+    print(f"\n siap={len(report['ready'])} belum={len(report['not_ready'])}")
+    return 0 if not report["not_ready"] else 1
 
-    def register_account(self, email: Optional[str] = None, password: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        tag = random_string(6)
-        email = email or f"farm_{tag}@gmail.com"
-        password = password or f"P@ss_{tag}_{random_string(4)}!"
-        name = random_name()
 
-        print(f"[*] Menyiapkan registrasi: {email}")
-        csrf_token = self._fetch_csrf_token()
-        if not csrf_token:
-            print("[-] Gagal mengekstrak CSRF token dari /register.")
-            return None
+def cmd_telegram_init(args: argparse.Namespace) -> int:
+    cfg.ensure_dirs()
+    dump_slots_template(cfg.SLOTS_FILE, count=args.count)
+    print(f"[+] Template {args.count} slot dibuat: {cfg.SLOTS_FILE}")
+    print("[*] Isi blok 'app' (api_id/api_hash dari my.telegram.org) di file itu.")
+    print("[*] Lalu provisioning sesi tiap slot: py -3.12 tg_session.py tg-001")
+    return 0
 
-        payload = {
-            "_token": csrf_token,
-            "name": name,
-            "email": email,
-            "phone": "",
-            "password": password,
-            "password_confirmation": password
-        }
 
-        self.session.headers.update({
-            "Origin": BASE_URL,
-            "Referer": f"{BASE_URL}/register"
-        })
+def cmd_run(args: argparse.Namespace) -> int:
+    cfg.ensure_dirs()
+    settings = cfg.load_settings()
+    if not cfg.SLOTS_FILE.is_file():
+        print(f"[-] {cfg.SLOTS_FILE.name} belum ada. Jalankan 'telegram-init' dulu.")
+        return 1
 
-        for attempt in range(1, self.retries + 1):
-            try:
-                print(f"    [->] Mengirim data registrasi (percobaan {attempt}/{self.retries})...")
-                try:
-                    res = self.session.post(f"{BASE_URL}/register", data=payload, timeout=self.timeout, allow_redirects=True)
-                except requests.exceptions.ReadTimeout:
-                    print("    [*] Server timeout kirim email, memverifikasi sesi login...")
-                    res = self.session.get(f"{BASE_URL}/dashboard", timeout=30)
-                
-                if res.status_code in [200, 302]:
-                    # Ekstraksi kode aktivasi Telegram & API key
-                    tg_match = re.search(r'globalTelegramVerifier\("([^"]+)",\s*"([^"]+)"\)', res.text)
-                    verify_code = tg_match.group(1) if tg_match else None
-                    bot_url = tg_match.group(2).replace(r"\/", "/") if tg_match else None
-                    
-                    cookies = self.session.cookies.get_dict()
-                    api_key, verify_code, bot_url = self._extract_key_and_telegram()
+    if settings.mock_mode:
+        print("[!] FM_MOCK_MODE aktif — target mock, bukan freemodel.in")
 
-                    
-                    # Auto Telegram Verifier jika dikonfigurasi
-                    if verify_code and os.path.exists(os.path.join(os.path.dirname(__file__), "tg_verifier.py")):
-                        try:
-                            import subprocess
-                            print(f"    [*] Mencoba auto-verify Telegram via @FreeModels_bbot...")
-                            cmd = ["py", "-3.12", os.path.join(os.path.dirname(__file__), "tg_verifier.py"), verify_code]
-                            subp = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                            if subp.returncode == 0:
-                                print(f"    [+] Telegram auto-verified: {subp.stdout.strip()}")
-                            else:
-                                print(f"    [!] Telegram auto-verify skip (cek config TG_API_ID): {subp.stdout or subp.stderr}")
-                        except Exception as tg_err:
-                            print(f"    [!] Telegram auto-verify error: {tg_err}")
+    pool = cfg.load_pool()
 
-                    account_data = {
-                        "name": name,
-                        "email": email,
-                        "password": password,
-                        "cookies": cookies,
-                        "telegram_verify_code": verify_code,
-                        "telegram_bot_url": bot_url,
-                        "api_key": api_key,
-                        "created_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                    }
+    if not settings.mock_mode and not args.dry_run:
+        report = pool.preflight()
+        if report["not_ready"]:
+            print(f"[-] {len(report['not_ready'])} slot belum punya sesi Telegram: "
+                  + ", ".join(report["not_ready"]))
+            print("[*] Lengkapi dulu: py -3.12 tg_session.py <slot_id>")
+            return 1
 
-                    print(f"[+] Akun berhasil dibuat: {email}")
-                    if verify_code:
-                        print(f"    - Telegram Verify Code: {verify_code}")
-                        print(f"    - Bot Claim Link: {bot_url}")
-                    if api_key:
-                        print(f"    - API Key: {api_key}")
+    store = AccountStore(cfg.ACCOUNTS_FILE, cfg.EVENTS_FILE)
+    runner = FarmRunner(
+        base_url=settings.base_url,
+        pool=pool,
+        store=store,
+        verifier=cfg.build_verifier(settings),
+        timeout=settings.timeout,
+        retries=settings.retries,
+        test_model=settings.test_model,
+        email_domain=settings.email_domain,
+        verbose=print,
+    )
+    report = runner.run(count=args.count, concurrency=args.concurrency, dry_run=args.dry_run)
 
-                    return account_data
+    print("\n" + "=" * 64)
+    print(" RINGKASAN")
+    print("=" * 64)
+    for key, value in report.summary().items():
+        print(f" {key:<13}: {value}")
+    print(f" accounts file: {cfg.ACCOUNTS_FILE}")
+    print(f" event log    : {cfg.EVENTS_FILE}")
+    return 0 if report.failed == 0 else 2
 
-            except requests.exceptions.RequestException as e:
-                print(f"    [!] Timeout/Network issue: {e}")
-                time.sleep(3)
 
-        print("[-] Gagal menyelesaikan registrasi setelah retry limit.")
-        return None
+def cmd_report(args: argparse.Namespace) -> int:
+    store = AccountStore(cfg.ACCOUNTS_FILE, cfg.EVENTS_FILE)
+    accounts = store.accounts()
+    if not accounts:
+        print("[*] Belum ada akun tercatat di state/accounts.json")
+        return 0
+    if args.json:
+        print(json.dumps(accounts, indent=2, ensure_ascii=False))
+        return 0
+    print(f"{'EMAIL':<34} {'SLOT':<10} {'STATE':<22} {'API KEY':<14}")
+    print("-" * 84)
+    for acc in sorted(accounts, key=lambda a: a.get("created_at", "")):
+        key = acc.get("api_key") or "-"
+        masked = (key[:8] + "...") if len(key) > 11 else key
+        print(f"{acc.get('email',''):<34} {acc.get('telegram_slot',''):<10} "
+              f"{acc.get('state',''):<22} {masked:<14}")
+    done = sum(1 for a in accounts if a.get("state") in (Lifecycle.DONE, Lifecycle.KEY_TESTED))
+    failed = sum(1 for a in accounts if a.get("state") == Lifecycle.FAILED)
+    print(f"\n total={len(accounts)} selesai={done} gagal={failed}")
+    return 0
 
-    def _extract_key_and_telegram(self):
-        api_key = None
-        verify_code = None
-        bot_url = None
-        try:
-            r = self.session.get(f"{BASE_URL}/dashboard/api-keys", timeout=self.timeout)
-            if r.status_code == 200:
-                raw = html.unescape(r.text)
-                matches = re.findall(r'fm_[a-f0-9]{32,64}', raw)
-                if matches:
-                    api_key = matches[0]
 
-                idx = raw.find('globalTelegramVerifier(')
-                if idx != -1:
-                    snippet = raw[idx:idx+300]
-                    sub = re.findall(r'fm_[0-9]+_[a-f0-9]+', snippet)
-                    if sub:
-                        verify_code = sub[0]
-                        bot_url = f"https://t.me/FreeModels_bbot?start=verify_{verify_code}"
-        except Exception as e:
-            print(f"    [!] Gagal scraping api-keys: {e}")
+def cmd_models(args: argparse.Namespace) -> int:
+    settings = cfg.load_settings()
+    client = FreeModelClient(base_url=settings.base_url, timeout=30)
+    try:
+        models = client.list_models()
+    finally:
+        client.close()
+    if not models:
+        print("[-] Gagal mengambil katalog model.")
+        return 1
+    print(f"[+] {len(models)} model tersedia:\n")
+    print(f"{'ID MODEL':<32} {'NAMA':<28} {'CONTEXT':>9}")
+    print("-" * 74)
+    for model in models[: args.limit]:
+        print(f"{str(model.get('id','')):<32} {str(model.get('name','')):<28} "
+              f"{str(model.get('context_window','-')):>9}")
+    return 0
 
-        return api_key, verify_code, bot_url
-class FreeModelAPI:
-    @staticmethod
-    def list_models() -> List[Dict[str, Any]]:
-        print(f"\n[*] Mengambil daftar model dari {API_V1}/models...")
-        try:
-            r = requests.get(f"{API_V1}/models", headers={"Accept": "application/json"}, timeout=25)
-            r.raise_for_status()
-            data = r.json()
-            models = data.get("data", [])
-            print(f"[+] Total model terdaftar: {len(models)}\n")
-            print(f"{'ID MODEL':<30} | {'NAMA':<25} | {'CONTEXT':<10} | {'CAPABILITIES'}")
-            print("-" * 90)
-            for m in models:
-                mid = m.get("id", "-")
-                name = m.get("name", "-")
-                ctx = str(m.get("context_window", "-"))
-                caps = ",".join(m.get("capabilities", []))
-                print(f"{mid:<30} | {name:<25} | {ctx:<10} | {caps}")
-            return models
-        except Exception as e:
-            print(f"[-] Gagal mengambil model list: {e}")
-            return []
 
-    @staticmethod
-    def test_completion(api_key: str, model: str = "claude-haiku-5.5") -> bool:
-        print(f"\n[*] Menguji chat completion via API key: {api_key[:10]}...")
-        url = f"{API_V1}/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": "Jawab singkat dalam 1 kata: 'Online'"}],
-            "max_tokens": 10
-        }
+def cmd_migrate(_args: argparse.Namespace) -> int:
+    """Pindahkan freemodel_accounts.json lama ke state/accounts.json."""
+    cfg.ensure_dirs()
+    legacy = read_json(cfg.LEGACY_ACCOUNTS_FILE, [])
+    if not isinstance(legacy, list) or not legacy:
+        print("[*] Tidak ada akun lama untuk dimigrasi.")
+        return 0
+    store = AccountStore(cfg.ACCOUNTS_FILE, cfg.EVENTS_FILE)
+    imported = 0
+    for index, old in enumerate(legacy, start=1):
+        email = old.get("email", "")
+        if not email or store.find_by_email(email):
+            continue
+        record = AccountRecord(
+            account_id=f"legacy_{index:03d}",
+            email=email,
+            name=old.get("name", ""),
+            password=old.get("password", ""),
+            telegram_slot="unmapped",
+            telegram_verify_code=old.get("telegram_verify_code", "") or "",
+            telegram_bot_url=old.get("telegram_bot_url", "") or "",
+            api_key=old.get("api_key", "") or "",
+            state=Lifecycle.DONE,
+            created_at=old.get("created_at", ""),
+        )
+        store.upsert(record)
+        store.log_event(record.account_id, Lifecycle.DONE, "migrasi dari freemodel_accounts.json")
+        imported += 1
+    print(f"[+] {imported} akun lama dimigrasi ke {cfg.ACCOUNTS_FILE}")
+    print("[!] Akun legacy belum punya slot Telegram — petakan manual bila mau dilanjutkan.")
+    return 0
 
-        try:
-            r = requests.post(url, headers=headers, json=body, timeout=30)
-            if r.status_code == 200:
-                resp = r.json()
-                reply = resp.get("choices", [{}])[0].get("message", {}).get("content", "")
-                print(f"[+] Response model ({model}): {reply.strip()}")
-                return True
-            else:
-                print(f"[-] API Error {r.status_code}: {r.text}")
-                return False
-        except Exception as e:
-            print(f"[-] Request gagal: {e}")
-            return False
 
-def run_farm(count: int = 1, output_file: str = "freemodel_accounts.json"):
-    accounts = []
-    farmer = FreeModelFarmer(timeout=90, retries=3)
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="freemodel_farmer.py",
+        description="Farm akun freemodel.in multi-instance dengan pemetaan 1 akun = 1 Telegram.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
 
-    for i in range(count):
-        print(f"\n--- Farming akun #{i+1} dari {count} ---")
-        acc = farmer.register_account()
-        if acc:
-            accounts.append(acc)
-            with open(output_file, "w", encoding="utf-8") as f:
-                json.dump(accounts, f, indent=2)
-            print(f"[✓] Data tersimpan di {output_file}")
-        time.sleep(2)
+    sub.add_parser("pool", help="tampilkan status pool akun Telegram").set_defaults(func=cmd_pool)
 
-    return accounts
+    sub.add_parser(
+        "preflight", help="cek kesiapan sesi Telegram semua slot sebelum farm"
+    ).set_defaults(func=cmd_preflight)
+
+    p_init = sub.add_parser("telegram-init", help="buat template daftar akun Telegram")
+    p_init.add_argument("count", type=int, nargs="?", default=1)
+    p_init.set_defaults(func=cmd_telegram_init)
+
+    p_run = sub.add_parser("run", help="jalankan registrasi multi-instance")
+    p_run.add_argument("--count", type=int, default=1, help="jumlah akun yang dibuat")
+    p_run.add_argument("--concurrency", type=int, default=1, help="instance paralel")
+    p_run.add_argument("--dry-run", action="store_true", help="uji alur tanpa menyentuh target")
+    p_run.set_defaults(func=cmd_run)
+
+    p_report = sub.add_parser("report", help="tampilkan akun yang sudah tercatat")
+    p_report.add_argument("--json", action="store_true")
+    p_report.set_defaults(func=cmd_report)
+
+    p_models = sub.add_parser("models", help="ambil katalog model dari target")
+    p_models.add_argument("--limit", type=int, default=50)
+    p_models.set_defaults(func=cmd_models)
+
+    sub.add_parser("migrate", help="impor freemodel_accounts.json lama").set_defaults(
+        func=cmd_migrate
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    cfg.bootstrap_env()
+    return int(args.func(args))
+
 
 if __name__ == "__main__":
-    print("=" * 60)
-    print(" FREEMODEL.IN AUTOMATION & TEST RUNNER")
-    print("=" * 60)
-
-    models = FreeModelAPI.list_models()
-
-    print("\n" + "=" * 60)
-    print(" MEMULAI FARMING AKUN")
-    print("=" * 60)
-    farmed = run_farm(count=1)
-
-    if farmed and farmed[0].get("api_key"):
-        FreeModelAPI.test_completion(farmed[0]["api_key"])
+    sys.exit(main())

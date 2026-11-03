@@ -1,5 +1,10 @@
 __pycache__/
 *.pyc
+.env
 freemodel_accounts.json
 cookies.txt
 *.log
+state/
+telegram_sessions/
+config/telegram_accounts.json
+_probe/

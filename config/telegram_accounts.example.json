@@ -1,0 +1,23 @@
+{
+  "_catatan": "api_id/api_hash dari https://my.telegram.org. session_string diisi sekali per akun Telegram (lihat tg_session.py). Jangan commit file telegram_accounts.json.",
+  "app": {
+    "api_id": 0,
+    "api_hash": ""
+  },
+  "slots": [
+    {
+      "slot_id": "tg-001",
+      "phone": "+6281XXXXXXXX",
+      "session_name": "fm_tg_001",
+      "session_string": "",
+      "proxy": null
+    },
+    {
+      "slot_id": "tg-002",
+      "phone": "+6282XXXXXXXX",
+      "session_name": "fm_tg_002",
+      "session_string": "",
+      "proxy": null
+    }
+  ]
+}

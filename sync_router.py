@@ -3,6 +3,8 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
+
 import requests
 
 def get_router_credentials():
@@ -27,6 +29,115 @@ def get_router_credentials():
     
     base_url = os.environ.get("ROUTER_BASE_URL", "https://router.aestc.id")
     return base_url, api_key
+
+
+def resolve_accounts_file(explicit=None, root=None):
+    """Pilih file akun: eksplisit -> state/accounts.json -> freemodel_accounts.json.
+
+    Setelah refactor, akun baru hidup di state/accounts.json; file lama di root
+    hanya dipertahankan supaya instalasi lama tetap bisa disinkronkan.
+    """
+    base = Path(root) if root else Path(__file__).resolve().parent
+    candidates = [
+        explicit,
+        str(base / "state" / "accounts.json"),
+        str(base / "freemodel_accounts.json"),
+    ]
+    for candidate in candidates:
+        if candidate and os.path.exists(candidate):
+            return candidate
+    return candidates[1]
+
+
+def load_account_records(path):
+    """Normalisasi dua format penyimpanan menjadi list of dict.
+
+    Format baru: {"accounts": {id: record}}  (dict)
+    Format lama: [record, record]            (list)
+    """
+    if not path or not os.path.exists(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError) as exc:
+        print(f"[-] Gagal membaca {path}: {exc}")
+        return []
+
+    if isinstance(data, dict):
+        accounts = data.get("accounts", {})
+        # Toleransi bila suatu saat ditulis sebagai list di dalam dict.
+        if isinstance(accounts, dict):
+            return [rec for rec in accounts.values() if isinstance(rec, dict)]
+        if isinstance(accounts, list):
+            return [rec for rec in accounts if isinstance(rec, dict)]
+        return []
+    if isinstance(data, list):
+        return [rec for rec in data if isinstance(rec, dict)]
+    return []
+
+
+def extract_sync_keys(records):
+    """Ambil pasangan (email, api_key) yang layak disinkronkan."""
+    pairs = []
+    for record in records:
+        key = record.get("api_key") or ""
+        email = record.get("email") or ""
+        # freemodel menerbitkan fm_; cc_ dipertahankan untuk akun lama.
+        if email and key.startswith(("fm_", "cc_")):
+            pairs.append((email, key))
+    return pairs
+
+
+def test_provider_connection(session, url, timeout=45):
+    """Uji kredensial provider; timeout/HTTP error jadi status, bukan exception.
+
+    Endpoint test di router bisa menggantung >15s saat upstream lambat. Dulu
+    exception-nya lolos ke atas dan mematikan seluruh proses sinkronisasi.
+    """
+    try:
+        response = session.post(url, timeout=timeout)
+    except requests.exceptions.ReadTimeout as exc:
+        return "timeout", str(exc)
+    except requests.exceptions.RequestException as exc:
+        return "network_error", str(exc)
+
+    if response.status_code != 200:
+        body = (getattr(response, "text", "") or "").strip()
+        return f"http_{response.status_code}", body[:200] or "tanpa body"
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return "invalid_json", str(exc)
+    valid = payload.get("valid")
+    return ("valid" if valid else "invalid"), str(payload)[:200]
+
+
+def find_provider_node(nodes, node_name, base_url):
+    """Cari node FreeModel berdasarkan name, prefix, atau base URL."""
+    normalized_url = base_url.rstrip("/").lower()
+    normalized_name = node_name.lower()
+    for node in nodes:
+        if node.get("type") != "openai-compatible":
+            continue
+        name = str(node.get("name", "")).rstrip("/").lower()
+        prefix = str(node.get("prefix", "")).lower()
+        node_url = str(node.get("baseUrl", "")).rstrip("/").lower()
+        if name == normalized_name or prefix == normalized_name or node_url == normalized_url:
+            return node.get("id")
+    return None
+
+
+def build_node_payload(node_name, base_url):
+    """Payload API provider-nodes sesuai schema 9Router yang teramati."""
+    return {
+        "name": node_name,
+        "prefix": "freemodel",
+        "type": "openai-compatible",
+        "apiType": "chat",
+        "baseUrl": base_url.rstrip("/"),
+    }
+
 
 class RouterSyncer:
     def __init__(self, base_url, api_key, node_name="FreeModel"):
@@ -59,23 +170,18 @@ class RouterSyncer:
             return None
         
         nodes = r.json().get("nodes", [])
-        for n in nodes:
-            if n.get("type") == "openai-compatible" and (n.get("name", "").lower() == self.node_name.lower() or n.get("prefix", "").lower() == self.node_name.lower()):
-                self.provider_id = n.get("id")
-                print(f"[+] Ditemukan provider node: {self.node_name} (ID: {self.provider_id})")
-                return self.provider_id
+        self.provider_id = find_provider_node(
+            nodes, self.node_name, "https://freemodel.in/v1"
+        )
+        if self.provider_id:
+            print(f"[+] Ditemukan provider node: {self.node_name} (ID: {self.provider_id})")
+            return self.provider_id
 
         # Buat custom node jika belum ada
         print(f"[*] Membuat provider node baru: {self.node_name}...")
         create_url = f"{self.base_url}/api/provider-nodes"
-        payload = {
-            "name": self.node_name,
-            "prefix": "freemodel",
-            "type": "openai-compatible",
-            "baseUrl": "https://freemodel.in/v1",
-            "models": ["claude-mythos-preview", "claude-fable-5", "claude-opus-5-5", "gpt-6-astra", "gemini-3.7-flash"]
-        }
-        r_create = self.session.post(create_url, json=payload, timeout=15)
+        node_payload = build_node_payload(self.node_name, "https://freemodel.in/v1")
+        r_create = self.session.post(create_url, json=node_payload, timeout=15)
         if r_create.status_code in [200, 201]:
             self.provider_id = r_create.json().get("node", {}).get("id")
             print(f"[+] Provider node {self.node_name} dibuat (ID: {self.provider_id})")
@@ -84,20 +190,15 @@ class RouterSyncer:
             print(f"[-] Gagal membuat provider node: {r_create.status_code} - {r_create.text}")
             return None
 
-    def sync_keys(self, accounts_file="freemodel_accounts.json"):
-        if not os.path.exists(accounts_file):
-            print(f"[-] File akun {accounts_file} tidak ditemukan.")
+    def sync_keys(self, accounts_file=None):
+        accounts_file = resolve_accounts_file(accounts_file)
+        records = load_account_records(accounts_file)
+        if not records:
+            print(f"[-] Tidak ada record akun di {accounts_file}.")
             return
 
-        with open(accounts_file, "r", encoding="utf-8") as f:
-            accounts = json.load(f)
-
-        keys_to_sync = []
-        for acc in accounts:
-            key = acc.get("api_key")
-            email = acc.get("email")
-            if key and key.startswith("cc_"):
-                keys_to_sync.append((email, key))
+        print(f"[*] Membaca {len(records)} akun dari {accounts_file}")
+        keys_to_sync = extract_sync_keys(records)
 
         if not keys_to_sync:
             print("[*] Belum ada API key terdaftar di akun. (Selesaikan verifikasi telegram untuk mengklaim API key)")
@@ -132,17 +233,22 @@ class RouterSyncer:
                 print(f"[+] Berhasil sinkronisasi: {conn_name}")
                 # Test credential
                 if conn_id:
-                    test_res = self.session.post(f"{self.base_url}/api/providers/{conn_id}/test", timeout=15)
-                    print(f"    - Status tes: {test_res.json().get('valid')}")
+                    status, detail = test_provider_connection(
+                        self.session, f"{self.base_url}/api/providers/{conn_id}/test"
+                    )
+                    print(f"    - Status tes: {status} ({detail})")
             else:
                 print(f"[-] Gagal menambahkan {conn_name}: {res.status_code} - {res.text}")
 
 if __name__ == "__main__":
     base_url, api_key = get_router_credentials()
+    explicit = sys.argv[1] if len(sys.argv) > 1 else None
+    accounts_path = resolve_accounts_file(explicit)
     print("=" * 60)
     print(f" 9ROUTER AUTO SYNC -> {base_url}")
+    print(f" sumber akun       -> {accounts_path}")
     print("=" * 60)
     syncer = RouterSyncer(base_url, api_key, node_name="FreeModel")
     if syncer.login():
         if syncer.get_or_create_provider_node():
-            syncer.sync_keys()
+            syncer.sync_keys(accounts_path)
