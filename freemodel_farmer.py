@@ -1,3 +1,4 @@
+import html
 #!/usr/bin/env python3
 # ==============================================================================
 # FREEMODEL.IN ACCOUNT FARMER & API TESTER
@@ -90,7 +91,7 @@ class FreeModelFarmer:
                     bot_url = tg_match.group(2).replace(r"\/", "/") if tg_match else None
                     
                     cookies = self.session.cookies.get_dict()
-                    api_key = self._extract_api_key()
+                    api_key, verify_code, bot_url = self._extract_key_and_telegram()
 
                     account_data = {
                         "name": name,
@@ -119,17 +120,29 @@ class FreeModelFarmer:
         print("[-] Gagal menyelesaikan registrasi setelah retry limit.")
         return None
 
-    def _extract_api_key(self) -> Optional[str]:
+    def _extract_key_and_telegram(self):
+        api_key = None
+        verify_code = None
+        bot_url = None
         try:
             r = self.session.get(f"{BASE_URL}/dashboard/api-keys", timeout=self.timeout)
             if r.status_code == 200:
-                keys = re.findall(r'cc_[a-zA-Z0-9_\-]+', r.text)
-                if keys:
-                    return keys[0]
-        except Exception:
-            pass
-        return None
+                raw = html.unescape(r.text)
+                matches = re.findall(r'fm_[a-f0-9]{32,64}', raw)
+                if matches:
+                    api_key = matches[0]
 
+                idx = raw.find('globalTelegramVerifier(')
+                if idx != -1:
+                    snippet = raw[idx:idx+300]
+                    sub = re.findall(r'fm_[0-9]+_[a-f0-9]+', snippet)
+                    if sub:
+                        verify_code = sub[0]
+                        bot_url = f"https://t.me/FreeModels_bbot?start=verify_{verify_code}"
+        except Exception as e:
+            print(f"    [!] Gagal scraping api-keys: {e}")
+
+        return api_key, verify_code, bot_url
 class FreeModelAPI:
     @staticmethod
     def list_models() -> List[Dict[str, Any]]:
