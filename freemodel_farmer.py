@@ -93,6 +93,21 @@ class FreeModelFarmer:
                     cookies = self.session.cookies.get_dict()
                     api_key, verify_code, bot_url = self._extract_key_and_telegram()
 
+                    
+                    # Auto Telegram Verifier jika dikonfigurasi
+                    if verify_code and os.path.exists(os.path.join(os.path.dirname(__file__), "tg_verifier.py")):
+                        try:
+                            import subprocess
+                            print(f"    [*] Mencoba auto-verify Telegram via @FreeModels_bbot...")
+                            cmd = ["py", "-3.12", os.path.join(os.path.dirname(__file__), "tg_verifier.py"), verify_code]
+                            subp = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                            if subp.returncode == 0:
+                                print(f"    [+] Telegram auto-verified: {subp.stdout.strip()}")
+                            else:
+                                print(f"    [!] Telegram auto-verify skip (cek config TG_API_ID): {subp.stdout or subp.stderr}")
+                        except Exception as tg_err:
+                            print(f"    [!] Telegram auto-verify error: {tg_err}")
+
                     account_data = {
                         "name": name,
                         "email": email,
