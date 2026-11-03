@@ -22,7 +22,10 @@ if sys.version_info < (3, 10):
 
 from farm import config as cfg
 from farm.client import FreeModelClient
-from farm.runner import FarmRunner, Lifecycle
+from farm.router import RouterImporter
+from farm.runner import FarmRunner, Lifecycle, auto_plan
+from farm.settings import FarmSettings
+from farm.sink import KeySink
 from farm.store import AccountRecord, AccountStore, read_json
 from farm.telegram import dump_slots_template
 
@@ -92,6 +95,17 @@ def cmd_run(args: argparse.Namespace) -> int:
 
     pool = cfg.load_pool()
 
+    if args.auto:
+        plan = auto_plan(pool)
+        if plan is None:
+            print("[-] Mode 1-klik: tidak ada slot Telegram bebas (semua sudah terikat).")
+            print("[*] Tambah slot di config/telegram_accounts.json lalu jalankan lagi,\n"
+                  "    atau pakai --count/--concurrency untuk mode manual.")
+            return 1
+        args.count, args.concurrency = plan
+        print(f"[*] Mode 1-klik: {args.count} slot bebas -> farm {args.count} akun "
+              f"sekaligus (concurrency={args.concurrency})")
+
     if not settings.mock_mode and not args.dry_run:
         report = pool.preflight()
         if report["not_ready"]:
@@ -100,35 +114,72 @@ def cmd_run(args: argparse.Namespace) -> int:
             print("[*] Lengkapi dulu: py -3.12 tg_session.py <slot_id>")
             return 1
 
-    store = AccountStore(cfg.ACCOUNTS_FILE, cfg.EVENTS_FILE)
+    farm_settings = FarmSettings(cfg.FARM_SETTINGS_FILE, root=cfg.PROJECT_ROOT)
+    target = int(farm_settings.get("worker.target", 0))
+    if not args.auto and target > 0 and args.count == 1:
+        args.count = target
+    if args.auto:
+        plan = auto_plan(pool)
+        if plan is None:
+            print("[-] Mode 1-klik: tidak ada slot Telegram bebas (semua sudah terikat).")
+            return 1
+        args.count, args.concurrency = plan
+
+    output_accounts = farm_settings.abs_path("output.accountsFile")
+    output_keys = farm_settings.abs_path("output.keysFile")
+    store = AccountStore(output_accounts, cfg.EVENTS_FILE)
+    importer = None
+    if farm_settings.get("router.autoImport"):
+        router_url, router_key = cfg.router_credentials()
+        importer = RouterImporter(
+            router_url,
+            router_key,
+            node_name=str(farm_settings.get("router.nodeName", "FreeModel")),
+            log=print,
+        )
+    sink = KeySink(output_keys, importer=importer)
+    proxy_pool = farm_settings.proxy_list() if farm_settings.get("proxy.enabled") else []
     runner = FarmRunner(
         base_url=settings.base_url,
         pool=pool,
         store=store,
         verifier=cfg.build_verifier(settings),
-        timeout=settings.timeout,
-        retries=settings.retries,
+        timeout=float(farm_settings.get("worker.timeoutSec", settings.timeout)),
+        retries=int(farm_settings.get("worker.retries", settings.retries)),
         test_model=settings.test_model,
         email_domain=settings.email_domain,
+        sink=sink,
+        proxy_pool=proxy_pool,
         verbose=print,
     )
     report = runner.run(count=args.count, concurrency=args.concurrency, dry_run=args.dry_run)
+
 
     print("\n" + "=" * 64)
     print(" RINGKASAN")
     print("=" * 64)
     for key, value in report.summary().items():
         print(f" {key:<13}: {value}")
-    print(f" accounts file: {cfg.ACCOUNTS_FILE}")
+    print(f" accounts file: {output_accounts}")
+    print(f" keys file    : {output_keys}")
     print(f" event log    : {cfg.EVENTS_FILE}")
     return 0 if report.failed == 0 else 2
 
 
+def cmd_tui(_args: argparse.Namespace) -> int:
+    """Buka UI interaktif: menu opsi + dashboard live."""
+    import farm_tui
+
+    return farm_tui.main()
+
+
 def cmd_report(args: argparse.Namespace) -> int:
-    store = AccountStore(cfg.ACCOUNTS_FILE, cfg.EVENTS_FILE)
+    farm_settings = FarmSettings(cfg.FARM_SETTINGS_FILE, root=cfg.PROJECT_ROOT)
+    accounts_path = farm_settings.abs_path("output.accountsFile")
+    store = AccountStore(accounts_path, cfg.EVENTS_FILE)
     accounts = store.accounts()
     if not accounts:
-        print("[*] Belum ada akun tercatat di state/accounts.json")
+        print(f"[*] Belum ada akun tercatat di {accounts_path}")
         return 0
     if args.json:
         print(json.dumps(accounts, indent=2, ensure_ascii=False))
@@ -218,6 +269,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_run = sub.add_parser("run", help="jalankan registrasi multi-instance")
     p_run.add_argument("--count", type=int, default=1, help="jumlah akun yang dibuat")
     p_run.add_argument("--concurrency", type=int, default=1, help="instance paralel")
+    p_run.add_argument("--auto", action="store_true",
+                       help="mode 1-klik: pakai semua slot bebas sekaligus (count=concurrency)")
     p_run.add_argument("--dry-run", action="store_true", help="uji alur tanpa menyentuh target")
     p_run.set_defaults(func=cmd_run)
 
@@ -231,6 +284,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sub.add_parser("migrate", help="impor freemodel_accounts.json lama").set_defaults(
         func=cmd_migrate
+    )
+
+    sub.add_parser("tui", help="UI interaktif: menu opsi + dashboard live").set_defaults(
+        func=cmd_tui
     )
     return parser
 

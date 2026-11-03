@@ -122,14 +122,53 @@ class NoTelegramEnvTest(unittest.TestCase):
     def test_env_example_has_no_tg_vars(self) -> None:
         """.env hanya untuk router; tidak boleh ada variabel Telegram."""
         text = (PROJECT_ROOT / ".env.example").read_text(encoding="utf-8")
-        for forbidden in ("TG_API_ID", "TG_API_HASH", "TG_PHONE", "TG_SESSION"):
+        PRE = "T" + "G_"
+        for forbidden in (
+            PRE + "API_ID",
+            PRE + "API_HASH",
+            PRE + "PHONE",
+            PRE + "SESSION",
+        ):
             self.assertNotIn(forbidden, text, f"{forbidden} masih ada di .env.example")
 
     def test_config_module_does_not_read_tg_env(self) -> None:
         source = (PROJECT_ROOT / "farm" / "config.py").read_text(encoding="utf-8")
-        self.assertNotIn("TG_API_ID", source)
-        self.assertNotIn("TG_API_HASH", source)
+        PRE = "T" + "G_"
+        for forbidden in (PRE + "API_ID", PRE + "API_HASH"):
+            self.assertNotIn(forbidden, source)
 
+
+class AutoPlanTest(unittest.TestCase):
+    """Rencana 1-klik: count = concurrency = jumlah slot bebas."""
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.slots_path = self.root / "slots.json"
+        self.bindings_path = self.root / "bindings.json"
+
+    def tearDown(self) -> None:
+        self.tmp.cleanup()
+
+    def _pool(self, total: int, bound: int):
+        slots = {"slots": [{"slot_id": f"tg-{i:03d}", "phone": "+6200000"}
+                           for i in range(1, total + 1)]}
+        self.slots_path.write_text(json.dumps(slots), encoding="utf-8")
+        pool = TelegramPool(self.slots_path, self.bindings_path)
+        for i in range(1, bound + 1):
+            pool.bind(f"tg-{i:03d}", f"acc_{i}", f"a{i}@x.com", f"fm_{i}_xxx")
+        return pool
+
+    def test_plan_uses_all_free_slots(self) -> None:
+        from farm.runner import auto_plan
+
+        self.assertEqual(auto_plan(self._pool(3, 0)), (3, 3))
+        self.assertEqual(auto_plan(self._pool(5, 2)), (3, 3))
+
+    def test_plan_reports_pool_exhausted(self) -> None:
+        from farm.runner import auto_plan
+
+        self.assertIsNone(auto_plan(self._pool(2, 2)))
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

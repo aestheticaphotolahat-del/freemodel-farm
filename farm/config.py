@@ -20,6 +20,7 @@ EVENTS_FILE = STATE_DIR / "events.jsonl"
 LEGACY_ACCOUNTS_FILE = PROJECT_ROOT / "freemodel_accounts.json"
 SLOTS_FILE = CONFIG_DIR / "telegram_accounts.json"
 BINDINGS_FILE = STATE_DIR / "telegram_bindings.json"
+FARM_SETTINGS_FILE = CONFIG_DIR / "farm_settings.json"
 
 # Batas tunggu balasan bot Telegram (detik). Tuning, bukan kredensial.
 TG_REPLY_TIMEOUT = 45.0
@@ -65,6 +66,15 @@ def ensure_dirs() -> None:
 def load_pool() -> TelegramPool:
     ensure_dirs()
     return TelegramPool(SLOTS_FILE, BINDINGS_FILE, sessions_dir=SESSIONS_DIR)
+
+
+def router_credentials() -> tuple[str, str]:
+    """Base URL + API key router. .env hanya untuk ini, bukan untuk Telegram."""
+    bootstrap_env()
+    return (
+        os.environ.get("ROUTER_BASE_URL", "https://router.aestc.id").rstrip("/"),
+        os.environ.get("ROUTER_API_KEY", ""),
+    )
 
 
 def build_verifier(settings: Settings) -> Verifier:

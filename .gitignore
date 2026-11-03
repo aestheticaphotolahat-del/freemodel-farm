@@ -7,4 +7,9 @@ cookies.txt
 state/
 telegram_sessions/
 config/telegram_accounts.json
+config/farm_settings.json
 _probe/
+keys.txt
+*.lock
+pools/
+logs/

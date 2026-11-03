@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from .client import FreeModelClient
 from .identity import Persona, build_persona
+from .sink import KeySink
 from .store import AccountRecord, AccountStore
 from .telegram import DuplicateBindingError, TelegramPool, TelegramSlot
 from .verifier import VerifyOutcome, Verifier
@@ -29,9 +30,21 @@ class Lifecycle:
     AWAITING_CODE = "awaiting_verify_code"
     TG_VERIFIED = "telegram_verified"
     KEY_TESTED = "api_key_tested"
+    ROUTER_SYNCED = "router_synced"
     DONE = "done"
     FAILED = "failed"
     SKIPPED = "skipped"
+
+
+def auto_plan(pool: TelegramPool) -> tuple[int, int] | None:
+    """Rencana mode 1-klik: pakai SEMUA slot bebas sekaligus, sepenuhnya paralel.
+
+    Return (count, concurrency) atau None kalau tidak ada slot bebas.
+    """
+    free = len(pool.available_slots())
+    if free <= 0:
+        return None
+    return free, free
 
 
 @dataclass
@@ -98,6 +111,8 @@ class FarmRunner:
         retries: int = 3,
         test_model: str = "claude-mythos-preview",
         email_domain: str = "gmail.com",
+        sink: KeySink | None = None,
+        proxy_pool: list[str] | None = None,
         verbose: Callable[[str], None] | None = None,
     ) -> None:
         self.base_url = base_url
@@ -108,8 +123,20 @@ class FarmRunner:
         self.retries = retries
         self.test_model = test_model
         self.email_domain = email_domain
+        self.sink = sink
+        self.proxy_pool = list(proxy_pool or [])
+        self._proxy_index = 0
         self._say = verbose or (lambda _msg: None)
         self._print_lock = threading.Lock()
+
+    def _next_proxy(self) -> str | None:
+        """Rotasi proxy bergiliran; None kalau pool kosong (IP bawaan)."""
+        if not self.proxy_pool:
+            return None
+        with self._print_lock:
+            proxy = self.proxy_pool[self._proxy_index % len(self.proxy_pool)]
+            self._proxy_index += 1
+        return proxy
 
     def _log(self, message: str) -> None:
         with self._print_lock:
@@ -123,6 +150,10 @@ class FarmRunner:
             concurrency=concurrency,
         )
         self._log(f"[*] Memulai {count} instance, konkurensi={concurrency}, target={self.base_url}")
+        if self.proxy_pool:
+            self._log(f"[*] Proxy aktif: {len(self.proxy_pool)} entri (rotasi bergiliran)")
+        if self.sink is not None:
+            self._log(f"[*] Keluaran: {self.sink.prepare()}")
 
         with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="farm") as pool:
             futures: list[Future[InstanceResult]] = [
@@ -197,6 +228,7 @@ class FarmRunner:
             persona=persona,
             timeout=self.timeout,
             retries=self.retries,
+            proxy=self._next_proxy(),
         )
         try:
             self._log(f"    [->] #{index} register {persona.email} (slot {slot.slot_id})")
@@ -264,6 +296,12 @@ class FarmRunner:
             else:
                 record.state = Lifecycle.DONE
                 self.store.log_event(account_id, Lifecycle.DONE, "key belum teruji / belum terbit")
+
+            # Keluaran: keys.txt + auto-import router, dijalankan per key.
+            if record.api_key and self.sink is not None:
+                note = self.sink.handle(persona.email, record.api_key)
+                self.store.log_event(account_id, Lifecycle.ROUTER_SYNCED, note)
+                self._log(f"    [+] #{index} {note}")
 
             record.history.append({"state": record.state, "at": datetime.now(timezone.utc).isoformat()})
             self.store.upsert(record)
