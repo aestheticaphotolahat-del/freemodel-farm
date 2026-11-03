@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+freemodel_accounts.json
+cookies.txt
+*.log
